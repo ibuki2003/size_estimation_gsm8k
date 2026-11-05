@@ -1,5 +1,9 @@
 # 数値回答限定 GSM8K ベンチマーク
 
+https://llmsize.fuwa.dev/
+
+ref: [N8 Programs on X](https://x.com/N8Programs/status/2025785575236624516)
+
 GSM8Kを算数の問題集として使い、途中式・説明なしの回答精度を測ります。
 通常のCoTありGSM8Kスコアとは別の指標です。
 プロンプトと出力制約で推論の言語化を抑えますが、モデル内部の推論禁止は保証しません。
