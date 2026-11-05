@@ -16,6 +16,7 @@ uv run benchmark.py \
   --model your-model \
   --provider openai \
   --model-author 'model-creator' \
+  --effort none \
   --parameters '32B' \
   --active-parameters '3B' \
   --concurrency 4 \
@@ -34,9 +35,9 @@ uv run benchmark.py \
 同じCSVに実験予定と結果をまとめられます。まず結果の2列を空欄にします。
 
 ```csv
-model,parameters,active_parameters,model_author,provider,correct,timestamp
-your-model,32B,3B,model-creator,openai
-another-model,unknown,,another-creator,vllm
+model,parameters,active_parameters,model_author,provider,effort,correct,timestamp
+your-model,32B,3B,model-creator,openai,none
+another-model,unknown,,another-creator,openrouter,low
 ```
 
 ```sh
@@ -46,7 +47,8 @@ uv run batch.py results.csv --concurrency 4
 未完了行を上から順に実行し、1319問が揃った行だけ結果を埋めます。
 完了済み行はスキップします。`correct`と`timestamp`の片方だけが空欄の行はエラーです。
 末尾の空欄はカンマごと省略できます。途中の空欄には区切りのカンマが必要です。
-従来の6列CSV・旧列順も読み込め、次の結果保存時に新しい列順になります。
+従来のCSV・旧列順も読み込め、欠けている`model_author`・`effort`は空欄になります。
+次の結果保存時に新しい列順になります。
 
 中断したら同じコマンドで再開してください。
 再開ファイルは既定で`results.csv.checkpoints/`に保存します。
@@ -87,10 +89,36 @@ API固有の推論抑制・出力制約は`extra_body`に指定できます。
 OpenAIのStructured Outputsはトップレベルの整数を許可しないため、
 数値だけの出力を強制する方法としては利用できません。
 
+### Reasoning effort
+
+単発実行では`--effort none`などで指定し、バッチ実行ではCSVの`effort`列に書きます。
+CSVでは入力列の最後に配置し、省略・空欄なら追加の指定は送りません。
+`extra_body`にすでに設定がある場合は、明示した`effort`が優先されます。
+
+- `--provider openrouter`: `reasoning.effort`として送信
+- OpenAI（その他の互換APIを含む）: `reasoning_effort`として送信
+
+OpenRouterの設定名は`openrouter`を使用してください。
+指定できる値はモデル次第です（例: `none`・`minimal`・`low`・`medium`・`high`）。
+推論トークンも出力上限を消費するため、effortを上げる場合は`max_tokens`にも注意してください。
+
 接続先や生成設定は`--base-url`・`--token-env`・`--max-tokens`・`--temperature`・
 `--timeout`・`--extra-body`でも上書きできます。
 `--extra-body`は設定ファイルの`extra_body`全体を置き換えます。
 出力上限・温度の指定に非対応のモデルでは利用できません。
+出力上限の指定名はCLIでは`--max-tokens`、configでは`max_tokens`です。
+APIへの送信時は`provider=openai`なら`max_completion_tokens`、それ以外なら`max_tokens`を使います。
+
+## デバッグログ
+
+単発・バッチとも、`--request-log path/to/debug.jsonl`を指定した場合だけログを追記します。
+指定しなければログは保存しません。
+1行にprovider、実際に送信したリクエストbody、レスポンスのHTTPステータスとbodyをまとめます。
+HTTPエラーのレスポンスも記録し、JSON以外のbodyは文字列として残します。
+接続失敗など、レスポンスを受信できなかったリクエストは記録されません。
+
+CSV集計・再開判定には使用しません。APIキーなどのヘッダーも記録しません。
+ログの書き込み失敗は警告のみとし、ベンチマークは続行します。
 
 ## 採点・再開
 
@@ -98,7 +126,7 @@ OpenAIのStructured Outputsはトップレベルの整数を許可しないた�
 正解値と数値比較するため、`42` と `42.0` は同じです。
 単位・説明・Markdown・桁区切り・指数表記は許可せず、出力上限による打ち切りも不正解です。
 
-CSVの列は `model,parameters,active_parameters,model_author,provider,correct,timestamp` です。
+CSVの列は `model,parameters,active_parameters,model_author,provider,effort,correct,timestamp` です。
 `correct` は1319問中の正解数、`timestamp` は全件完了時のUTC日時です。
 
 APIエラーやCtrl+Cで停止した場合は、**同じ引数で再実行**してください。
@@ -106,7 +134,10 @@ APIエラーやCtrl+Cで停止した場合は、**同じ引数で再実行**し�
 CSVは全件が揃ったときだけ更新します。中断時や実験条件を変える際は再開ファイルを残してください。
 新しい実験には別の `--checkpoint` を指定します。
 
-再開ファイルには問題ごとの応答と採点結果が含まれます。APIトークンは保存しません。
+進捗はメモリ上で保持し、Ctrl+C・APIエラーなどによる中断時だけ再開ファイルを保存します。
+保存内容は実行条件・正解数・完了済み問題番号で、応答本文やAPIトークンは保存しません。
+正常終了時はCSVへの記録後に再開ファイルを削除します。
+SIGKILL・電源断などでは、前回の保存以降の進捗は失われます。
 同じCSV・再開ファイルを使う複数プロセスの同時実行には対応していません。
 
 ## ファイル

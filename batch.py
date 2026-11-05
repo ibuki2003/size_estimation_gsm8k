@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["openai>=1.55,<3", "datasets>=3,<5", "python-dotenv>=1,<2"]
+# dependencies = ["openai>=1.55,<3", "datasets>=3,<5", "python-dotenv>=1,<2", "httpx>=0.27,<1"]
 # ///
 import argparse
 import asyncio
@@ -19,6 +19,7 @@ def parse_args(argv=None):
     parser.add_argument("--config", type=Path, default=Path("config.toml"))
     parser.add_argument("--env-file", type=Path, default=Path(".env"))
     parser.add_argument("--checkpoint-dir", type=Path)
+    parser.add_argument("--request-log", type=Path, help="指定時のみJSONLログを保存")
     parser.add_argument("--concurrency", type=benchmark.positive_int, default=4)
     return parser.parse_args(argv)
 
@@ -31,7 +32,9 @@ def plan(args) -> list:
     occurrences = Counter()
     jobs = []
     for index, row in enumerate(rows):
-        identity = [row[key] for key in benchmark.INPUT_COLUMNS]
+        identity = [
+            row[key] for key in benchmark.INPUT_COLUMNS if key != "effort" or row[key]
+        ]
         key = json.dumps(identity, ensure_ascii=False)
         occurrence = occurrences[key]
         occurrences[key] += 1
@@ -57,6 +60,7 @@ def plan(args) -> list:
                 "--model=" + row["model"],
                 "--provider=" + row["provider"],
                 "--model-author=" + row["model_author"],
+                "--effort=" + row["effort"],
                 "--parameters=" + row["parameters"],
                 "--active-parameters=" + row["active_parameters"],
                 "--csv",
@@ -67,6 +71,7 @@ def plan(args) -> list:
                 str(args.concurrency),
             ]
         )
+        job.request_log = args.request_log
         job.csv_row = index
         jobs.append(job)
     return jobs

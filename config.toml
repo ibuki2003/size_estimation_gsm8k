@@ -1,5 +1,5 @@
 system_prompt = """
-Solve the arithmetic word problem. Do not reason step by step. \
+Solve the arithmetic word problem. Do not reason at all.
 Do not produce explanations, intermediate calculations, units, or formatting. \
 Output only the final answer as a single integer or decimal number."""
 
@@ -13,6 +13,13 @@ timeout = 120
 [providers.vllm]
 base_url = "http://localhost:8000/v1"
 token_env = "VLLM_API_KEY"
+temperature = 0
+max_tokens = 64
+timeout = 120
+
+[providers.openrouter]
+base_url = "https://openrouter.ai/api/v1"
+token_env = "OPENROUTER_API_KEY"
 temperature = 0
 max_tokens = 64
 timeout = 120

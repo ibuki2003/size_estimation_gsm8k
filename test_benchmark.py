@@ -14,6 +14,23 @@ class BenchmarkTests(unittest.TestCase):
         for response in ("Answer: 42", "42 dollars", "40+2=42", "4.2e1", ""):
             self.assertFalse(b.is_correct(response, "42"))
 
+    def test_effort_request_formats(self):
+        for provider, expected in (
+            ("openai", {"reasoning_effort": "none"}),
+            ("openrouter", {"reasoning": {"effort": "none"}}),
+        ):
+            args = SimpleNamespace(
+                provider=provider,
+                effort="none",
+                extra_body={
+                    "reasoning_effort": "high",
+                    "reasoning": {"effort": "high"},
+                },
+            )
+            self.assertEqual(b.request_body(args), expected)
+        args.effort = ""
+        self.assertEqual(b.request_body(args), args.extra_body)
+
     def test_csv_trailing_columns_can_be_omitted(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "results.csv"
@@ -24,13 +41,15 @@ class BenchmarkTests(unittest.TestCase):
             rows = b.read_csv(path)
             self.assertEqual(rows[0]["active_parameters"], "")
             self.assertEqual(rows[0]["provider"], "host")
+            self.assertEqual(rows[0]["effort"], "")
             self.assertEqual(rows[0]["correct"], "")
             self.assertEqual(rows[0]["timestamp"], "")
             self.assertEqual(
                 rows[1], {key: "other" if key == "model" else "" for key in b.COLUMNS}
             )
             path.write_text(
-                header + "model,32B,,author,host,,,extra\n", encoding="utf-8"
+                header + ",".join(["extra"] * (len(b.COLUMNS) + 1)) + "\n",
+                encoding="utf-8",
             )
             with self.assertRaises(ValueError):
                 b.read_csv(path)
@@ -47,10 +66,12 @@ class BenchmarkTests(unittest.TestCase):
             path = Path(directory)
             args = SimpleNamespace(
                 model="model",
+                provider="openai",
                 system_prompt="Number only",
                 temperature=0,
                 max_tokens=64,
                 extra_body={},
+                effort="",
                 concurrency=1,
                 checkpoint=path / "checkpoint.json",
             )
@@ -60,6 +81,7 @@ class BenchmarkTests(unittest.TestCase):
                 active_parameters=None,
                 model_author="author",
                 provider="host",
+                effort="",
             )
             questions = [{"question": "question", "answer": "42"}] * 2
             create = AsyncMock(side_effect=[response, RuntimeError("API error")])
@@ -69,8 +91,11 @@ class BenchmarkTests(unittest.TestCase):
             state = b.load_state(args.checkpoint, config)
             with self.assertRaises(RuntimeError):
                 asyncio.run(b.solve(client, args, questions, state))
+            self.assertFalse(args.checkpoint.exists())
+            b.atomic_json(args.checkpoint, state)
             state = b.load_state(args.checkpoint, config)
-            self.assertEqual(len(state["results"]), 1)
+            self.assertEqual(state["completed"], [0])
+            self.assertEqual(state["correct"], 1)
             csv_path = path / "results.csv"
             with self.assertRaises(ValueError):
                 b.record_csv(csv_path, state)
@@ -84,6 +109,8 @@ class BenchmarkTests(unittest.TestCase):
             rows = b.read_csv(csv_path)
             self.assertEqual(len(rows), 1)
             self.assertEqual(rows[0]["correct"], "2")
+            self.assertEqual(create.call_args.kwargs["max_completion_tokens"], 64)
+            self.assertNotIn("max_tokens", create.call_args.kwargs)
 
 
 if __name__ == "__main__":

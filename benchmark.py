@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["openai>=1.55,<3", "datasets>=3,<5", "python-dotenv>=1,<2"]
+# dependencies = ["openai>=1.55,<3", "datasets>=3,<5", "python-dotenv>=1,<2", "httpx>=0.27,<1"]
 # ///
 import argparse
 import asyncio
@@ -23,6 +23,7 @@ INPUT_COLUMNS = [
     "active_parameters",
     "model_author",
     "provider",
+    "effort",
 ]
 COLUMNS = INPUT_COLUMNS + ["correct", "timestamp"]
 NUMBER = re.compile(r"[+-]?(?:[0-9]+(?:\.[0-9]+)?|\.[0-9]+)")
@@ -31,6 +32,43 @@ NUMBER = re.compile(r"[+-]?(?:[0-9]+(?:\.[0-9]+)?|\.[0-9]+)")
 def is_correct(response: str, answer: str) -> bool:
     value = response.strip()
     return bool(NUMBER.fullmatch(value)) and Decimal(value) == Decimal(answer)
+
+
+def request_body(args) -> dict:
+    body = dict(args.extra_body)
+    if not args.effort:
+        return body
+    body.pop("reasoning_effort", None)
+    reasoning = dict(body.pop("reasoning", {}))
+    reasoning.pop("effort", None)
+    if args.provider == "openrouter":
+        reasoning["effort"] = args.effort
+    else:
+        body["reasoning_effort"] = args.effort
+    if reasoning:
+        body["reasoning"] = reasoning
+    return body
+
+
+def response_logger(path: Path, provider: str):
+    async def log(response):
+        await response.aread()
+        try:
+            body = response.json()
+        except ValueError:
+            body = response.text
+        entry = {
+            "provider": provider,
+            "request": json.loads(response.request.content),
+            "response": {"status_code": response.status_code, "body": body},
+        }
+        try:
+            with path.open("a", encoding="utf-8") as stream:
+                stream.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        except OSError as error:
+            print(f"\nログを書き込めません: {error}", file=sys.stderr)
+
+    return log
 
 
 def atomic_json(path: Path, value: dict) -> None:
@@ -68,9 +106,10 @@ def configuration(args: argparse.Namespace, questions: list[dict]) -> dict:
         "active_parameters": args.active_parameters,
         "provider": args.provider,
         "model_author": args.model_author,
+        "effort": args.effort,
         "temperature": args.temperature,
         "max_tokens": args.max_tokens,
-        "extra_body": args.extra_body,
+        "extra_body": request_body(args),
         "system_prompt": args.system_prompt,
         "dataset_sha256": digest,
     }
@@ -81,25 +120,45 @@ def load_state(path: Path, config: dict) -> dict:
         state = json.loads(path.read_text(encoding="utf-8"))
         saved_config = {**state["config"]}
         saved_config.setdefault("model_author", None)
-        if state["version"] != 1 or saved_config != config:
+        saved_config.setdefault("effort", "")
+        if state["version"] not in (1, 2) or saved_config != config:
             raise ValueError(
                 "再開ファイルと実行条件が異なります。別の--checkpointを指定してください"
             )
         state["config"] = saved_config
-        results = state["results"]
-        if not isinstance(results, dict) or any(
-            not key.isdigit() or str(int(key)) != key or not 0 <= int(key) < TOTAL
-            for key in results
+        if state["version"] == 1:
+            results = state.pop("results")
+            state["completed"] = [int(key) for key in results]
+            state["correct"] = sum(result["correct"] for result in results.values())
+            state["version"] = 2
+        completed = state["completed"]
+        if (
+            not isinstance(completed, list)
+            or any(
+                type(index) is not int or not 0 <= index < TOTAL for index in completed
+            )
+            or len(completed) != len(set(completed))
         ):
             raise ValueError("再開ファイルの問題番号が不正です")
         return state
-    state = {"version": 1, "config": config, "results": {}, "timestamp": None}
-    atomic_json(path, state)
-    return state
+    return {
+        "version": 2,
+        "config": config,
+        "completed": [],
+        "correct": 0,
+        "timestamp": None,
+    }
 
 
 async def solve(client, args, questions: list[dict], state: dict) -> None:
-    pending = iter(i for i in range(TOTAL) if str(i) not in state["results"])
+    completed = set(state["completed"])
+    pending = iter(i for i in range(TOTAL) if i not in completed)
+    body = request_body(args)
+    token_limit = {
+        "max_completion_tokens"
+        if args.provider == "openai"
+        else "max_tokens": args.max_tokens
+    }
 
     async def worker():
         for index in pending:
@@ -110,8 +169,8 @@ async def solve(client, args, questions: list[dict], state: dict) -> None:
                     {"role": "user", "content": questions[index]["question"]},
                 ],
                 temperature=args.temperature,
-                max_tokens=args.max_tokens,
-                extra_body=args.extra_body,
+                extra_body=body,
+                **token_limit,
             )
             choice = response.choices[0]
             content = choice.message.content
@@ -121,15 +180,10 @@ async def solve(client, args, questions: list[dict], state: dict) -> None:
                 and content is not None
                 and is_correct(content, questions[index]["answer"])
             )
-            state["results"][str(index)] = {
-                "response": content,
-                "finish_reason": choice.finish_reason,
-                "correct": correct,
-            }
-            # No await between updating the state and persisting it.
-            atomic_json(args.checkpoint, state)
+            state["completed"].append(index)
+            state["correct"] += int(correct)
             print(
-                f"\r完了: {len(state['results'])}/{TOTAL}",
+                f"\r完了: {len(state['completed'])}/{TOTAL}",
                 end="",
                 file=sys.stderr,
                 flush=True,
@@ -150,13 +204,14 @@ def read_csv(path: Path) -> list[dict]:
         if (
             reader.fieldnames is None
             or len(reader.fieldnames) != len(set(reader.fieldnames))
-            or set(reader.fieldnames)
-            not in (set(COLUMNS), set(COLUMNS) - {"model_author"})
+            or not set(COLUMNS) - {"model_author", "effort"} <= set(reader.fieldnames)
+            or not set(reader.fieldnames) <= set(COLUMNS)
         ):
             raise ValueError("既存CSVの列が期待する形式と異なります")
         rows = list(reader)
     for row in rows:
         row.setdefault("model_author", "")
+        row.setdefault("effort", "")
         if set(row) != set(COLUMNS):
             raise ValueError("CSVの行の列数が不正です")
         for key, value in row.items():
@@ -175,17 +230,18 @@ def write_csv(path: Path, rows: list[dict]) -> None:
 
 
 def record_csv(path: Path, state: dict, row_index: int | None = None) -> None:
-    if len(state["results"]) != TOTAL:
+    if len(state["completed"]) != TOTAL:
         raise ValueError("全件が完了するまでCSVには記録できません")
     config = state["config"]
     row = {
         "model": config["model"],
         "parameters": config["parameters"],
         "active_parameters": config["active_parameters"],
-        "correct": sum(result["correct"] for result in state["results"].values()),
+        "correct": state["correct"],
         "timestamp": state["timestamp"],
         "provider": config["provider"],
         "model_author": config.get("model_author"),
+        "effort": config.get("effort", ""),
     }
     normalized = {
         key: "" if value is None else str(value) for key, value in row.items()
@@ -214,24 +270,42 @@ async def run(args) -> None:
     load_dotenv(dotenv_path=args.env_file, override=False)
     questions = load_questions()
     state = load_state(args.checkpoint, configuration(args, questions))
-    if len(state["results"]) < TOTAL:
-        from openai import AsyncOpenAI
+    try:
+        if len(state["completed"]) < TOTAL:
+            import httpx
+            from openai import AsyncOpenAI
 
-        token = os.environ.get(args.token_env)
-        if not token:
-            raise ValueError(f"環境変数{args.token_env}にAPIトークンを設定してください")
-        async with AsyncOpenAI(
-            api_key=token,
-            base_url=args.base_url,
-            timeout=args.timeout,
-            max_retries=0,
-        ) as client:
-            await solve(client, args, questions, state)
-    if not state["timestamp"]:
-        state["timestamp"] = datetime.now(timezone.utc).isoformat()
+            token = os.environ.get(args.token_env)
+            if not token:
+                raise ValueError(
+                    f"環境変数{args.token_env}にAPIトークンを設定してください"
+                )
+            hooks = (
+                {"response": [response_logger(args.request_log, args.provider)]}
+                if args.request_log
+                else {}
+            )
+            async with AsyncOpenAI(
+                api_key=token,
+                base_url=args.base_url,
+                timeout=args.timeout,
+                max_retries=0,
+                http_client=httpx.AsyncClient(event_hooks=hooks),
+            ) as client:
+                await solve(client, args, questions, state)
+        if not state["timestamp"]:
+            state["timestamp"] = datetime.now(timezone.utc).isoformat()
+        record_csv(args.csv, state, getattr(args, "csv_row", None))
+        args.checkpoint.unlink(missing_ok=True)
+    except (Exception, asyncio.CancelledError, KeyboardInterrupt):
         atomic_json(args.checkpoint, state)
-    record_csv(args.csv, state, getattr(args, "csv_row", None))
-    correct = sum(item["correct"] for item in state["results"].values())
+        print(
+            f"\n中断時点: 完了 {len(state['completed'])}/{TOTAL}, 正解 {state['correct']}"
+            f"\n再開ファイル: {args.checkpoint}",
+            file=sys.stderr,
+        )
+        raise
+    correct = state["correct"]
     print(
         f"\n正解: {correct}/{TOTAL} ({correct / TOTAL:.2%}) → {args.csv}",
         file=sys.stderr,
@@ -252,6 +326,9 @@ def parse_args(argv=None):
     parser.add_argument("--model", required=True)
     parser.add_argument("--provider", required=True, help="config内のprovider名")
     parser.add_argument("--model-author", help="モデル作成者（記録用メタデータ）")
+    parser.add_argument(
+        "--effort", default="", help="reasoning effort（空欄なら指定しない）"
+    )
     parser.add_argument("--base-url", help="configの接続先を上書き")
     parser.add_argument("--token-env", help="configのトークン環境変数名を上書き")
     parser.add_argument("--parameters", help="総パラメータ数の表記（文字列のまま記録）")
@@ -267,6 +344,7 @@ def parse_args(argv=None):
     )
     parser.add_argument("--csv", type=Path, default=Path("results.csv"))
     parser.add_argument("--checkpoint", type=Path, default=Path("checkpoint.json"))
+    parser.add_argument("--request-log", type=Path, help="指定時のみJSONLログを保存")
     args = parser.parse_args(argv)
     try:
         with args.config.open("rb") as stream:
@@ -301,7 +379,15 @@ def parse_args(argv=None):
             parser.error(f"{name}には数値を指定してください")
     if not isinstance(args.extra_body, dict):
         parser.error("extra_bodyにはオブジェクトを指定してください")
-    reserved = {"model", "messages", "temperature", "max_tokens", "stream", "n"}
+    reserved = {
+        "model",
+        "messages",
+        "temperature",
+        "max_tokens",
+        "max_completion_tokens",
+        "stream",
+        "n",
+    }
     if reserved & args.extra_body.keys():
         parser.error("--extra-bodyで標準リクエスト項目は上書きできません")
     if args.timeout <= 0:
