@@ -223,7 +223,7 @@ def read_csv(path: Path) -> list[dict]:
 def write_csv(path: Path, rows: list[dict]) -> None:
     temporary = path.with_name(path.name + ".tmp")
     with temporary.open("w", newline="", encoding="utf-8") as stream:
-        writer = csv.DictWriter(stream, fieldnames=COLUMNS)
+        writer = csv.DictWriter(stream, fieldnames=COLUMNS, lineterminator="\n")
         writer.writeheader()
         writer.writerows(rows)
     temporary.replace(path)
