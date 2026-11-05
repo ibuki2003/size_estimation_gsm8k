@@ -24,18 +24,44 @@ INPUT_COLUMNS = [
     "model_author",
     "provider",
     "effort",
+    "answer_format",
 ]
 COLUMNS = INPUT_COLUMNS + ["correct", "timestamp"]
 NUMBER = re.compile(r"[+-]?(?:[0-9]+(?:\.[0-9]+)?|\.[0-9]+)")
 
 
-def is_correct(response: str, answer: str) -> bool:
+def is_correct(response: str, answer: str, answer_format: str = "plain") -> bool:
+    if answer_format == "json":
+        try:
+            value = json.loads(response)
+        except ValueError:
+            return False
+        return (
+            isinstance(value, dict)
+            and set(value) == {"answer"}
+            and type(value["answer"]) is int
+            and Decimal(value["answer"]) == Decimal(answer)
+        )
     value = response.strip()
     return bool(NUMBER.fullmatch(value)) and Decimal(value) == Decimal(answer)
 
 
 def request_body(args) -> dict:
     body = dict(args.extra_body)
+    if args.answer_format == "json":
+        body["response_format"] = {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "answer",
+                "strict": True,
+                "schema": {
+                    "type": "object",
+                    "properties": {"answer": {"type": "integer"}},
+                    "required": ["answer"],
+                    "additionalProperties": False,
+                },
+            },
+        }
     if not args.effort:
         return body
     body.pop("reasoning_effort", None)
@@ -107,6 +133,7 @@ def configuration(args: argparse.Namespace, questions: list[dict]) -> dict:
         "provider": args.provider,
         "model_author": args.model_author,
         "effort": args.effort,
+        "answer_format": args.answer_format,
         "temperature": args.temperature,
         "max_tokens": args.max_tokens,
         "extra_body": request_body(args),
@@ -121,6 +148,7 @@ def load_state(path: Path, config: dict) -> dict:
         saved_config = {**state["config"]}
         saved_config.setdefault("model_author", None)
         saved_config.setdefault("effort", "")
+        saved_config.setdefault("answer_format", "plain")
         if state["version"] not in (1, 2) or saved_config != config:
             raise ValueError(
                 "再開ファイルと実行条件が異なります。別の--checkpointを指定してください"
@@ -150,6 +178,41 @@ def load_state(path: Path, config: dict) -> dict:
     }
 
 
+def checkpoint_path(args, config: dict) -> Path:
+    if args.checkpoint is not None:
+        return args.checkpoint
+    digest = hashlib.sha256(
+        json.dumps(config, ensure_ascii=False, sort_keys=True).encode()
+    ).hexdigest()
+    directory = getattr(args, "checkpoint_dir", None) or args.csv.with_name(
+        args.csv.name + ".checkpoints"
+    )
+    prefix = getattr(args, "checkpoint_prefix", "")
+    return directory / f"{prefix}{digest}.json"
+
+
+def check_reasoning(response) -> None:
+    body = response.model_dump()
+    for choice in body.get("choices", []):
+        message = choice.get("message") or {}
+        for key in ("reasoning", "reasoning_content", "reasoning_details"):
+            if message.get(key):
+                raise ValueError(f"reasoningを検出しました: message.{key}")
+        content = message.get("content") or ""
+        if re.search(r"<(?:think|reasoning)(?:\s[^>]*)?>", content, re.IGNORECASE):
+            raise ValueError("reasoningを検出しました: message.content内の思考タグ")
+
+    def check_tokens(value, path):
+        if isinstance(value, dict):
+            for key, item in value.items():
+                field = f"{path}.{key}"
+                if "reasoning" in key and isinstance(item, (int, float)) and item != 0:
+                    raise ValueError(f"reasoningを検出しました: {field}={item}")
+                check_tokens(item, field)
+
+    check_tokens(body.get("usage"), "usage")
+
+
 async def solve(client, args, questions: list[dict], state: dict) -> None:
     completed = set(state["completed"])
     pending = iter(i for i in range(TOTAL) if i not in completed)
@@ -172,13 +235,14 @@ async def solve(client, args, questions: list[dict], state: dict) -> None:
                 extra_body=body,
                 **token_limit,
             )
+            check_reasoning(response)
             choice = response.choices[0]
             content = choice.message.content
             # A truncated response must not accidentally count as the right answer.
             correct = (
                 choice.finish_reason == "stop"
                 and content is not None
-                and is_correct(content, questions[index]["answer"])
+                and is_correct(content, questions[index]["answer"], args.answer_format)
             )
             state["completed"].append(index)
             state["correct"] += int(correct)
@@ -204,7 +268,8 @@ def read_csv(path: Path) -> list[dict]:
         if (
             reader.fieldnames is None
             or len(reader.fieldnames) != len(set(reader.fieldnames))
-            or not set(COLUMNS) - {"model_author", "effort"} <= set(reader.fieldnames)
+            or not set(COLUMNS) - {"model_author", "effort", "answer_format"}
+            <= set(reader.fieldnames)
             or not set(reader.fieldnames) <= set(COLUMNS)
         ):
             raise ValueError("既存CSVの列が期待する形式と異なります")
@@ -212,11 +277,15 @@ def read_csv(path: Path) -> list[dict]:
     for row in rows:
         row.setdefault("model_author", "")
         row.setdefault("effort", "")
+        row.setdefault("answer_format", "plain")
         if set(row) != set(COLUMNS):
             raise ValueError("CSVの行の列数が不正です")
         for key, value in row.items():
             if value is None:
                 row[key] = ""
+        row["answer_format"] = row["answer_format"] or "plain"
+        if row["answer_format"] not in ("plain", "json", "cfg"):
+            raise ValueError(f"CSVのanswer_formatが不正です: {row['answer_format']}")
     return rows
 
 
@@ -242,6 +311,7 @@ def record_csv(path: Path, state: dict, row_index: int | None = None) -> None:
         "provider": config["provider"],
         "model_author": config.get("model_author"),
         "effort": config.get("effort", ""),
+        "answer_format": config.get("answer_format", "plain"),
     }
     normalized = {
         key: "" if value is None else str(value) for key, value in row.items()
@@ -269,7 +339,11 @@ async def run(args) -> None:
 
     load_dotenv(dotenv_path=args.env_file, override=False)
     questions = load_questions()
-    state = load_state(args.checkpoint, configuration(args, questions))
+    config = configuration(args, questions)
+    args.checkpoint = checkpoint_path(args, config)
+    args.checkpoint.parent.mkdir(parents=True, exist_ok=True)
+    state = load_state(args.checkpoint, config)
+    print(f"再開ファイル: {args.checkpoint}", file=sys.stderr)
     try:
         if len(state["completed"]) < TOTAL:
             import httpx
@@ -329,6 +403,12 @@ def parse_args(argv=None):
     parser.add_argument(
         "--effort", default="", help="reasoning effort（空欄なら指定しない）"
     )
+    parser.add_argument(
+        "--answer-format",
+        choices=("plain", "json", "cfg"),
+        default="plain",
+        help="回答の制限方式（cfgは未実装）",
+    )
     parser.add_argument("--base-url", help="configの接続先を上書き")
     parser.add_argument("--token-env", help="configのトークン環境変数名を上書き")
     parser.add_argument("--parameters", help="総パラメータ数の表記（文字列のまま記録）")
@@ -343,9 +423,13 @@ def parse_args(argv=None):
         "--extra-body", type=json.loads, help="configの追加JSON全体を上書き"
     )
     parser.add_argument("--csv", type=Path, default=Path("results.csv"))
-    parser.add_argument("--checkpoint", type=Path, default=Path("checkpoint.json"))
+    parser.add_argument(
+        "--checkpoint", type=Path, help="再開ファイル（既定: 設定別に自動生成）"
+    )
     parser.add_argument("--request-log", type=Path, help="指定時のみJSONLログを保存")
     args = parser.parse_args(argv)
+    if args.answer_format == "cfg":
+        parser.error("answer_format=cfgは未実装です")
     try:
         with args.config.open("rb") as stream:
             config = tomllib.load(stream)
@@ -358,6 +442,12 @@ def parse_args(argv=None):
     args.system_prompt = config.get("system_prompt")
     if not isinstance(args.system_prompt, str) or not args.system_prompt.strip():
         parser.error("configに空でないsystem_promptが必要です")
+    if args.answer_format == "json":
+        args.system_prompt += (
+            '\nFor this request, override the output format above: output only a JSON '
+            'object with a single integer field "answer", e.g. {"answer": 10}. '
+            "Do not include reasoning or explanations."
+        )
     for name, default in (
         ("base_url", None),
         ("token_env", None),
@@ -392,7 +482,7 @@ def parse_args(argv=None):
         parser.error("--extra-bodyで標準リクエスト項目は上書きできません")
     if args.timeout <= 0:
         parser.error("--timeoutは正の数にしてください")
-    if args.csv.resolve() == args.checkpoint.resolve():
+    if args.checkpoint is not None and args.csv.resolve() == args.checkpoint.resolve():
         parser.error("--csvと--checkpointには別のパスを指定してください")
     return args
 

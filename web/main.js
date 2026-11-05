@@ -31,19 +31,19 @@ async function main() {
       ? `既知 ${plot.knownCount} 件　·　accuracy = ${regression.slope.toFixed(3)} × log₁₀(N) ${regression.intercept < 0 ? '−' : '+'} ${Math.abs(regression.intercept).toFixed(3)}　·　R² ${regression.r2?.toFixed(3) ?? '—'}`
       : `既知 ${plot.knownCount} 件　·　回帰にはサイズが異なる既知データが2件以上必要です`;
     const known = data.models.filter(model => model[key] !== null).map(model => ({
-      value: [model[key], model.accuracy], model, estimated: false,
+      value: [Math.log10(model[key]), model.accuracy], model, estimated: false,
     }));
     const estimated = (plot.estimates ?? []).filter(model => model.estimatedSize !== null).map(model => ({
-      value: [model.estimatedSize, model.accuracy], model, estimated: true,
+      value: [Math.log10(model.estimatedSize), model.accuracy], model, estimated: true,
     }));
     const unknownCount = data.models.length - known.length;
     card.querySelector('.note').textContent = `${unknownCount} 件がサイズ不明${regression ? ` / ${estimated.length} 件を回帰から推定` : '（回帰未成立のため未描画）'}。ドラッグで範囲を選択してズーム。下部スライダーでも範囲を調整できます。`;
     const sizes = [...known, ...estimated].map(point => point.value[0]);
-    const min = sizes.length ? Math.min(...sizes) / 1.8 : 1e9;
-    const max = sizes.length ? Math.max(...sizes) * 1.8 : 1e12;
+    const min = sizes.length ? Math.min(...sizes) - Math.log10(1.8) : 9;
+    const max = sizes.length ? Math.max(...sizes) + Math.log10(1.8) : 12;
     const line = regression ? Array.from({ length: 100 }, (_, i) => {
-      const x = Math.log10(min) + (Math.log10(max) - Math.log10(min)) * i / 99;
-      return [10 ** x, regression.slope * x + regression.intercept];
+      const x = min + (max - min) * i / 99;
+      return [x, regression.slope * x + regression.intercept];
     }) : [];
     const chart = echarts.init(card.querySelector('.chart'));
     chart.setOption({
@@ -60,15 +60,15 @@ async function main() {
           const model = point.model;
           const element = document.createElement('div');
           element.style.whiteSpace = 'pre-line';
-          element.textContent = `${model.model}\n${point.estimated ? '推定' : '実測'}サイズ: ${formatSize(point.value[0])}\n正答率: ${model.accuracy.toFixed(2)}% (${model.correct}/${data.total})\n提供: ${model.provider || '—'} / 作者: ${model.author || '—'}\n${model.timestamp || ''}`;
+          element.textContent = `${model.model}\n${point.estimated ? '推定' : '実測'}サイズ: ${formatSize(point.estimated ? model.estimatedSize : model[key])}\n正答率: ${model.accuracy.toFixed(2)}% (${model.correct}/${data.total})\n提供: ${model.provider || '—'} / 作者: ${model.author || '—'}\n${model.timestamp || ''}`;
           return element;
         },
       },
-      xAxis: { type: 'log', min, max, name: 'Parameters', nameLocation: 'middle', nameGap: 32, axisLabel: { formatter: formatSize }, splitLine: { lineStyle: { color: '#edf0ed' } } },
+      xAxis: { type: 'value', min, max, name: 'Parameters', nameLocation: 'middle', nameGap: 32, axisLabel: { formatter: value => formatSize(10 ** value) }, splitLine: { lineStyle: { color: '#edf0ed' } } },
       yAxis: { type: 'value', min: 0, max: 100, name: 'Accuracy (%)', splitLine: { lineStyle: { color: '#edf0ed' } } },
       toolbox: { right: 5, feature: { dataZoom: { title: { zoom: '領域ズーム', back: '戻る' } } } },
       dataZoom: [
-        { type: 'slider', xAxisIndex: 0, bottom: 12, height: 22 },
+        { type: 'slider', xAxisIndex: 0, bottom: 12, height: 22, labelFormatter: value => formatSize(10 ** value) },
         { type: 'inside', xAxisIndex: 0, zoomOnMouseWheel: false, moveOnMouseMove: false },
         { type: 'inside', yAxisIndex: 0, zoomOnMouseWheel: false, moveOnMouseMove: false },
       ],

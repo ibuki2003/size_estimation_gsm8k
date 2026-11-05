@@ -61,17 +61,18 @@ def plan(args) -> list:
                 "--provider=" + row["provider"],
                 "--model-author=" + row["model_author"],
                 "--effort=" + row["effort"],
+                "--answer-format=" + row["answer_format"],
                 "--parameters=" + row["parameters"],
                 "--active-parameters=" + row["active_parameters"],
                 "--csv",
                 str(args.csv),
-                "--checkpoint",
-                str(directory / f"{digest}.json"),
                 "--concurrency",
                 str(args.concurrency),
             ]
         )
         job.request_log = args.request_log
+        job.checkpoint_dir = directory
+        job.checkpoint_prefix = digest + "-"
         job.csv_row = index
         jobs.append(job)
     return jobs
@@ -80,10 +81,8 @@ def plan(args) -> list:
 async def run(args) -> None:
     jobs = plan(args)
     for job in jobs:
-        job.checkpoint.parent.mkdir(parents=True, exist_ok=True)
         print(
-            f"CSV {job.csv_row + 2}行目: {job.provider} / {job.model}"
-            f"\n再開ファイル: {job.checkpoint}",
+            f"CSV {job.csv_row + 2}行目: {job.provider} / {job.model}",
             file=sys.stderr,
         )
         await benchmark.run(job)

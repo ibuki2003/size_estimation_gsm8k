@@ -16,11 +16,17 @@ function parameters(value, row, column) {
 }
 
 export function buildData(csv) {
-  const records = parse(csv, { columns: true, skip_empty_lines: true, bom: true });
+  const records = parse(csv, {
+    columns: true,
+    skip_empty_lines: true,
+    bom: true,
+    relax_column_count_less: true,
+  });
   const models = records.flatMap((record, index) => {
     if (record.effort?.trim() !== 'none' || !record.correct?.trim()) return [];
     const correct = Number(record.correct);
-    if (!Number.isInteger(correct) || correct < 0 || correct > TOTAL) {
+    if (!Number.isFinite(correct) || correct < 0) return [];
+    if (!Number.isInteger(correct) || correct > TOTAL) {
       throw new Error(`CSV row ${index + 2}: invalid correct: ${record.correct}`);
     }
     return [{
