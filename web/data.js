@@ -2,6 +2,29 @@ import { parse } from 'csv-parse/sync';
 
 const TOTAL = 1319;
 
+// With t = sqrt(df) * tan(theta), the t density is proportional to cos(theta)^(df - 1).
+function studentT975(df) {
+  const integral = end => {
+    const steps = 2048;
+    const h = end / steps;
+    let sum = 0;
+    for (let i = 0; i <= steps; i++) {
+      sum += (i === 0 || i === steps ? 1 : i % 2 ? 4 : 2)
+        * Math.cos(i * h) ** (df - 1);
+    }
+    return sum * h / 3;
+  };
+  const target = integral(Math.PI / 2) * 0.95;
+  let low = 0;
+  let high = Math.PI / 2;
+  for (let i = 0; i < 50; i++) {
+    const mid = (low + high) / 2;
+    if (integral(mid) < target) low = mid;
+    else high = mid;
+  }
+  return Math.sqrt(df) * Math.tan((low + high) / 2);
+}
+
 // Bare numbers are parameter counts; K/M/B/T suffixes are also accepted.
 function parameters(value, row, column) {
   if (!value.trim()) return null;
@@ -60,13 +83,32 @@ function fit(models, key) {
   const residual = known.reduce((sum, model, i) =>
     sum + (model.accuracy - (slope * xs[i] + intercept)) ** 2, 0);
   const total = known.reduce((sum, model) => sum + (model.accuracy - meanY) ** 2, 0);
+  const prediction = known.length > 2 ? {
+    meanX,
+    meanY,
+    variance,
+    count: known.length,
+    squaredMargin: studentT975(known.length - 2) ** 2 * residual / (known.length - 2),
+  } : null;
   const estimates = models.filter(model => model[key] === null).map(model => {
     const value = slope === 0 ? NaN : 10 ** ((model.accuracy - intercept) / slope);
-    return { ...model, estimatedSize: Number.isFinite(value) && value > 0 ? value : null };
+    let logSizeInterval = null;
+    if (prediction) {
+      // Invert (y - fitted(x))² <= t² s² (1 + 1/n + (x - meanX)² / Sxx).
+      const k = prediction.squaredMargin;
+      const a = slope ** 2 - k / variance;
+      const delta = model.accuracy - meanY;
+      if (a > 0) {
+        const center = slope * delta / a;
+        const halfWidth = Math.sqrt(k * (delta ** 2 / variance + a * (1 + 1 / known.length))) / a;
+        logSizeInterval = [meanX + center - halfWidth, meanX + center + halfWidth];
+      }
+    }
+    return { ...model, estimatedSize: Number.isFinite(value) && value > 0 ? value : null, logSizeInterval };
   });
   return {
     knownCount: known.length,
-    regression: { slope, intercept, r2: total === 0 ? null : 1 - residual / total },
+    regression: { slope, intercept, r2: total === 0 ? null : 1 - residual / total, prediction },
     estimates,
   };
 }
