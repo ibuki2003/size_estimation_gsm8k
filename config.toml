@@ -1,0 +1,22 @@
+system_prompt = """
+Solve the arithmetic word problem. Do not reason step by step. \
+Do not produce explanations, intermediate calculations, units, or formatting. \
+Output only the final answer as a single integer or decimal number."""
+
+[providers.openai]
+base_url = "https://api.openai.com/v1"
+token_env = "OPENAI_API_KEY"
+temperature = 0
+max_tokens = 64
+timeout = 120
+
+[providers.vllm]
+base_url = "http://localhost:8000/v1"
+token_env = "VLLM_API_KEY"
+temperature = 0
+max_tokens = 64
+timeout = 120
+
+# 対応するvLLMで数値だけに制約する場合は、以下を有効にしてください。
+# [providers.vllm.extra_body.structured_outputs]
+# regex = '-?[0-9]+'
