@@ -6,6 +6,26 @@ import './style.css';
 
 echarts.use([ScatterChart, LineChart, CustomChart, GridComponent, LegendComponent, TooltipComponent, ToolboxComponent, DataZoomComponent, CanvasRenderer]);
 
+const authorColors = new Map(Object.entries({
+  openai: '#10a37f',
+  anthropic: '#c07858',
+  google: '#4285f4',
+  deepseek: '#4d6bfe',
+  zai: '#303030',
+  moonshotai: '#6850d8',
+  qwen: '#7c3aed',
+  xiaomi: '#ff6900',
+}));
+
+function authorColor(author) {
+  const key = author?.trim().toLowerCase() || '';
+  if (!key) return '#8a969b';
+  if (authorColors.has(key)) return authorColors.get(key);
+  let hash = 0;
+  for (const char of key) hash = (Math.imul(hash, 31) + char.codePointAt(0)) | 0;
+  return `hsl(${(hash >>> 0) % 360}, 60%, 43%)`;
+}
+
 const formatSize = value => {
   for (const [unit, scale] of [['T', 1e12], ['B', 1e9], ['M', 1e6], ['K', 1e3]]) {
     if (value >= scale) return `${Number((value / scale).toPrecision(3))}${unit}`;
@@ -32,9 +52,11 @@ async function main() {
       : `既知 ${plot.knownCount} 件　·　回帰にはサイズが異なる既知データが2件以上必要です`;
     const known = data.models.filter(model => model[key] !== null).map(model => ({
       value: [Math.log10(model[key]), model.accuracy], model, estimated: false,
+      itemStyle: { color: authorColor(model.author) },
     }));
     const estimated = (plot.estimates ?? []).filter(model => model.estimatedSize !== null).map(model => ({
       value: [Math.log10(model.estimatedSize), model.accuracy], model, estimated: true,
+      itemStyle: { color: '#fff', borderColor: authorColor(model.author), borderWidth: 2 },
     }));
     const unknownCount = data.models.length - known.length;
     card.querySelector('.note').textContent = `${unknownCount} 件がサイズ不明${regression ? ` / ${estimated.length} 件を回帰から推定` : '（回帰未成立のため未描画）'}。ドラッグで範囲を選択してズーム。下部スライダーでも範囲を調整できます。`;
@@ -95,7 +117,7 @@ async function main() {
           },
         }] : []),
         { name: '実測サイズ', type: 'scatter', symbolSize: 12, data: known },
-        { name: '推定サイズ', type: 'scatter', symbol: 'diamond', symbolSize: 14, itemStyle: { color: '#fff', borderColor: '#c17a37', borderWidth: 2 }, data: estimated },
+        { name: '推定サイズ', type: 'scatter', symbol: 'diamond', symbolSize: 14, itemStyle: { color: '#fff', borderColor: '#8a969b', borderWidth: 2 }, data: estimated },
         { name: '回帰直線', type: 'line', showSymbol: false, silent: true, lineStyle: { type: 'dashed', width: 1.5 }, data: line },
       ],
     });
