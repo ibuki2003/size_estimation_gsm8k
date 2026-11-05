@@ -243,6 +243,89 @@ class BenchmarkTests(unittest.TestCase):
         self.assertEqual(state, {"completed": [], "correct": 0})
         self.assertEqual(create.await_count, 1)
 
+    def test_error_drains_inflight_requests_without_starting_new_ones(self):
+        async def scenario(reasoning):
+            started = 0
+            all_started = asyncio.Event()
+            release = asyncio.Event()
+            cancelled = []
+            first_error = RuntimeError("first API error")
+            response = SimpleNamespace(
+                model_dump=lambda: {"choices": [{"message": {"content": "42"}}]},
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(content="42"), finish_reason="stop"
+                    )
+                ],
+            )
+
+            async def create(**kwargs):
+                nonlocal started
+                index = started
+                started += 1
+                if started == 3:
+                    all_started.set()
+                await all_started.wait()
+                if index == 0:
+                    if reasoning:
+                        return SimpleNamespace(
+                            model_dump=lambda: {
+                                "choices": [{"message": {"reasoning": "thinking"}}]
+                            }
+                        )
+                    raise first_error
+                try:
+                    await release.wait()
+                except asyncio.CancelledError:
+                    cancelled.append(index)
+                    raise
+                if index == 2:
+                    raise RuntimeError("later API error")
+                return response
+
+            args = SimpleNamespace(
+                model="model",
+                provider="openai",
+                system_prompt="number",
+                temperature=0,
+                max_tokens=64,
+                extra_body={},
+                effort="",
+                answer_format="plain",
+                concurrency=3,
+            )
+            client = SimpleNamespace(
+                chat=SimpleNamespace(completions=SimpleNamespace(create=create))
+            )
+            state = {"completed": [], "correct": 0}
+            task = asyncio.create_task(
+                b.solve(client, args, [{"question": "q", "answer": "42"}] * 5, state)
+            )
+            try:
+                await all_started.wait()
+                # Let the first worker fail while the other requests remain in flight.
+                await asyncio.sleep(0)
+                await asyncio.sleep(0)
+                self.assertFalse(task.done())
+                self.assertEqual(cancelled, [])
+                self.assertEqual(started, 3)
+            finally:
+                release.set()
+                with self.assertRaisesRegex(
+                    ValueError if reasoning else RuntimeError,
+                    "reasoning" if reasoning else "first API error",
+                ) as caught:
+                    await task
+            if not reasoning:
+                self.assertIs(caught.exception, first_error)
+            self.assertEqual(state, {"completed": [1], "correct": 1})
+            self.assertEqual(started, 3)
+            self.assertEqual(cancelled, [])
+
+        for reasoning in (False, True):
+            with self.subTest(reasoning=reasoning), patch.object(b, "TOTAL", 5):
+                asyncio.run(asyncio.wait_for(scenario(reasoning), timeout=5))
+
 
 if __name__ == "__main__":
     unittest.main()

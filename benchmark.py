@@ -222,9 +222,12 @@ async def solve(client, args, questions: list[dict], state: dict) -> None:
         if args.provider == "openai"
         else "max_tokens": args.max_tokens
     }
+    first_error = None
 
-    async def worker():
+    async def process_pending():
         for index in pending:
+            if first_error is not None:
+                return
             response = await client.chat.completions.create(
                 model=args.model,
                 messages=[
@@ -253,6 +256,18 @@ async def solve(client, args, questions: list[dict], state: dict) -> None:
                 flush=True,
             )
 
+    async def worker():
+        nonlocal first_error
+        try:
+            await process_pending()
+        except Exception as error:
+            if first_error is None:
+                first_error = error
+                print(
+                    f"\nエラー: {error}\n新規送信を停止し、実行中のリクエストの終了を待ちます。",
+                    file=sys.stderr,
+                )
+
     tasks = [asyncio.create_task(worker()) for _ in range(args.concurrency)]
     try:
         await asyncio.gather(*tasks)
@@ -260,6 +275,8 @@ async def solve(client, args, questions: list[dict], state: dict) -> None:
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+    if first_error is not None:
+        raise first_error
 
 
 def read_csv(path: Path) -> list[dict]:
