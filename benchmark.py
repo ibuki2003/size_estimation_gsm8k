@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["openai>=1.55,<3", "datasets>=3,<5"]
+# dependencies = ["openai>=1.55,<3", "datasets>=3,<5", "python-dotenv>=1,<2"]
 # ///
 import argparse
 import asyncio
@@ -17,14 +17,14 @@ from pathlib import Path
 
 
 TOTAL = 1319
-COLUMNS = [
+INPUT_COLUMNS = [
     "model",
     "parameters",
     "active_parameters",
-    "correct",
-    "timestamp",
+    "model_author",
     "provider",
 ]
+COLUMNS = INPUT_COLUMNS + ["correct", "timestamp"]
 NUMBER = re.compile(r"[+-]?(?:[0-9]+(?:\.[0-9]+)?|\.[0-9]+)")
 
 
@@ -67,6 +67,7 @@ def configuration(args: argparse.Namespace, questions: list[dict]) -> dict:
         "parameters": args.parameters,
         "active_parameters": args.active_parameters,
         "provider": args.provider,
+        "model_author": args.model_author,
         "temperature": args.temperature,
         "max_tokens": args.max_tokens,
         "extra_body": args.extra_body,
@@ -78,10 +79,13 @@ def configuration(args: argparse.Namespace, questions: list[dict]) -> dict:
 def load_state(path: Path, config: dict) -> dict:
     if path.exists():
         state = json.loads(path.read_text(encoding="utf-8"))
-        if state["version"] != 1 or state["config"] != config:
+        saved_config = {**state["config"]}
+        saved_config.setdefault("model_author", None)
+        if state["version"] != 1 or saved_config != config:
             raise ValueError(
                 "再開ファイルと実行条件が異なります。別の--checkpointを指定してください"
             )
+        state["config"] = saved_config
         results = state["results"]
         if not isinstance(results, dict) or any(
             not key.isdigit() or str(int(key)) != key or not 0 <= int(key) < TOTAL
@@ -140,7 +144,37 @@ async def solve(client, args, questions: list[dict], state: dict) -> None:
         await asyncio.gather(*tasks, return_exceptions=True)
 
 
-def record_csv(path: Path, state: dict) -> None:
+def read_csv(path: Path) -> list[dict]:
+    with path.open(newline="", encoding="utf-8") as stream:
+        reader = csv.DictReader(stream)
+        if (
+            reader.fieldnames is None
+            or len(reader.fieldnames) != len(set(reader.fieldnames))
+            or set(reader.fieldnames)
+            not in (set(COLUMNS), set(COLUMNS) - {"model_author"})
+        ):
+            raise ValueError("既存CSVの列が期待する形式と異なります")
+        rows = list(reader)
+    for row in rows:
+        row.setdefault("model_author", "")
+        if set(row) != set(COLUMNS):
+            raise ValueError("CSVの行の列数が不正です")
+        for key, value in row.items():
+            if value is None:
+                row[key] = ""
+    return rows
+
+
+def write_csv(path: Path, rows: list[dict]) -> None:
+    temporary = path.with_name(path.name + ".tmp")
+    with temporary.open("w", newline="", encoding="utf-8") as stream:
+        writer = csv.DictWriter(stream, fieldnames=COLUMNS)
+        writer.writeheader()
+        writer.writerows(rows)
+    temporary.replace(path)
+
+
+def record_csv(path: Path, state: dict, row_index: int | None = None) -> None:
     if len(state["results"]) != TOTAL:
         raise ValueError("全件が完了するまでCSVには記録できません")
     config = state["config"]
@@ -151,30 +185,33 @@ def record_csv(path: Path, state: dict) -> None:
         "correct": sum(result["correct"] for result in state["results"].values()),
         "timestamp": state["timestamp"],
         "provider": config["provider"],
+        "model_author": config.get("model_author"),
     }
     normalized = {
         key: "" if value is None else str(value) for key, value in row.items()
     }
-    rows = []
-    if path.exists():
-        with path.open(newline="", encoding="utf-8") as stream:
-            reader = csv.DictReader(stream)
-            if reader.fieldnames != COLUMNS:
-                raise ValueError("既存CSVの列が期待する形式と異なります")
-            rows = list(reader)
+    rows = read_csv(path) if path.exists() else []
+    if row_index is not None:
+        existing = rows[row_index]
+        if any(existing[key] != normalized[key] for key in INPUT_COLUMNS):
+            raise ValueError("実行中にCSVの対象行が変更されました")
+        if existing == normalized:
+            return
+        if existing["correct"] or existing["timestamp"]:
+            raise ValueError("対象行にはすでに結果があります")
+        rows[row_index] = normalized
+    else:
         # Recover safely if interrupted after CSV replacement but before exit.
         if normalized in rows:
             return
-    temporary = path.with_name(path.name + ".tmp")
-    with temporary.open("w", newline="", encoding="utf-8") as stream:
-        writer = csv.DictWriter(stream, fieldnames=COLUMNS)
-        writer.writeheader()
-        writer.writerows(rows)
-        writer.writerow(row)
-    temporary.replace(path)
+        rows.append(normalized)
+    write_csv(path, rows)
 
 
 async def run(args) -> None:
+    from dotenv import load_dotenv
+
+    load_dotenv(dotenv_path=args.env_file, override=False)
     questions = load_questions()
     state = load_state(args.checkpoint, configuration(args, questions))
     if len(state["results"]) < TOTAL:
@@ -193,7 +230,7 @@ async def run(args) -> None:
     if not state["timestamp"]:
         state["timestamp"] = datetime.now(timezone.utc).isoformat()
         atomic_json(args.checkpoint, state)
-    record_csv(args.csv, state)
+    record_csv(args.csv, state, getattr(args, "csv_row", None))
     correct = sum(item["correct"] for item in state["results"].values())
     print(
         f"\n正解: {correct}/{TOTAL} ({correct / TOTAL:.2%}) → {args.csv}",
@@ -211,8 +248,10 @@ def positive_int(value: str) -> int:
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="数値回答限定のGSM8K testベンチマーク")
     parser.add_argument("--config", type=Path, default=Path("config.toml"))
+    parser.add_argument("--env-file", type=Path, default=Path(".env"))
     parser.add_argument("--model", required=True)
     parser.add_argument("--provider", required=True, help="config内のprovider名")
+    parser.add_argument("--model-author", help="モデル作成者（記録用メタデータ）")
     parser.add_argument("--base-url", help="configの接続先を上書き")
     parser.add_argument("--token-env", help="configのトークン環境変数名を上書き")
     parser.add_argument("--parameters", help="総パラメータ数の表記（文字列のまま記録）")

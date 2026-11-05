@@ -15,6 +15,7 @@ export OPENAI_API_KEY='...'
 uv run benchmark.py \
   --model your-model \
   --provider openai \
+  --model-author 'model-creator' \
   --parameters '32B' \
   --active-parameters '3B' \
   --concurrency 4 \
@@ -25,6 +26,33 @@ uv run benchmark.py \
 `--provider`と`--model`は毎回必須です。既定のprovider・modelはありません。
 `parameters`・`active_parameters`は省略可能で、その場合はCSVが空欄になります。
 指定した文字列は数値変換・単位変換・空白除去をせず記録します。
+`model_author`はモデル作成者の記録用メタデータです（省略可能）。
+接続先・APIキーを選ぶのはAPI提供者を表す`provider`で、作成者は接続に影響しません。
+
+## CSVから一括実行
+
+同じCSVに実験予定と結果をまとめられます。まず結果の2列を空欄にします。
+
+```csv
+model,parameters,active_parameters,model_author,provider,correct,timestamp
+your-model,32B,3B,model-creator,openai
+another-model,unknown,,another-creator,vllm
+```
+
+```sh
+uv run batch.py results.csv --concurrency 4
+```
+
+未完了行を上から順に実行し、1319問が揃った行だけ結果を埋めます。
+完了済み行はスキップします。`correct`と`timestamp`の片方だけが空欄の行はエラーです。
+末尾の空欄はカンマごと省略できます。途中の空欄には区切りのカンマが必要です。
+従来の6列CSV・旧列順も読み込め、次の結果保存時に新しい列順になります。
+
+中断したら同じコマンドで再開してください。
+再開ファイルは既定で`results.csv.checkpoints/`に保存します。
+同一条件の行を複数書いても、それぞれ独立した実験になります。
+再開時は同一条件の行どうしの順序を維持し、CSVや実験条件は実行中に変更しないでください。
+`--checkpoint-dir`で再開ファイルの保存先を変更できます。
 
 ## 設定
 
@@ -49,6 +77,11 @@ regex = '-?[0-9]+'
 この例は`--provider local --model your-model`で選択します。
 トークンの値は設定ファイルには書かず、`token_env`で指定した環境変数に設定してください。
 
+カレントディレクトリの`.env`も自動で読み込みます。
+`.env.example`を参考に、providerごとのキーを記入してください。
+既存の環境変数が優先されます。別のファイルは`--env-file path/to/.env`で指定できます。
+`.env`・`.env.*`はGit管理対象外です（`.env.example`を除く）。
+
 API固有の推論抑制・出力制約は`extra_body`に指定できます。
 **対応する設定・値は提供元に確認してください。**
 OpenAIのStructured Outputsはトップレベルの整数を許可しないため、
@@ -65,7 +98,7 @@ OpenAIのStructured Outputsはトップレベルの整数を許可しないた�
 正解値と数値比較するため、`42` と `42.0` は同じです。
 単位・説明・Markdown・桁区切り・指数表記は許可せず、出力上限による打ち切りも不正解です。
 
-CSVの列は `model,parameters,active_parameters,correct,timestamp,provider` です。
+CSVの列は `model,parameters,active_parameters,model_author,provider,correct,timestamp` です。
 `correct` は1319問中の正解数、`timestamp` は全件完了時のUTC日時です。
 
 APIエラーやCtrl+Cで停止した場合は、**同じ引数で再実行**してください。
@@ -79,5 +112,9 @@ CSVは全件が揃ったときだけ更新します。中断時や実験条件�
 ## ファイル
 
 - `benchmark.py`: CLI・API呼び出し・採点・記録
+- `batch.py`: CSVの未完了行を一括実行
 - `config.toml`: system prompt・providerごとの接続先とAPI設定
-- `test_benchmark.py`: 外部APIを呼ばないテスト（`python -m unittest -v`）
+- `.env.example`: APIキー設定のひな形
+- `test_benchmark.py`: 採点・CSV・中断と再開の最小限のテスト
+
+テスト: `python -m unittest -v`

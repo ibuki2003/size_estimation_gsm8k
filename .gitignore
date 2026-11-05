@@ -3,3 +3,7 @@ __pycache__/
 *.csv
 *checkpoint*.json
 *.tmp
+.env
+.env.*
+!.env.example
+*.checkpoints/
